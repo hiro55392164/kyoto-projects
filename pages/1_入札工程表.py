@@ -1,5 +1,7 @@
 """Editable bid schedule with SQLite persistence and a daily timeline."""
 import io
+import hashlib
+import sys
 import json
 import os
 import sqlite3
@@ -9,6 +11,9 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from notice_reader import pdf_content, extract_rules, extract_ai
 
 COLUMNS = ['件名', '配置技術者名', '申請日', '入札日', '開札日', '工期開始', '工期終了', '備考']
 DATES = COLUMNS[2:7]
@@ -95,6 +100,79 @@ st.caption('セルをクリックして編集。最下行で案件を追加し�
 config = {c: st.column_config.DateColumn(c, format='YYYY/MM/DD') for c in DATES}
 config['件名'] = st.column_config.TextColumn('件名', required=True, width='large')
 edited = st.data_editor(st.session_state.bid_frame, column_config=config, num_rows='dynamic', hide_index=True, width='stretch', key=f'bid_editor_{st.session_state.bid_editor_version}')
+with st.expander('入札公告PDFから案件を追加', expanded=False):
+    st.caption('PDFを読み取った後、内容を確認・修正して表へ追加できます。申請日は申請期限、入札日は入札書提出期限として読み取ります。')
+    upload = st.file_uploader('入札公告PDF（20ページ・15MBまで）', type=['pdf'], key='notice_pdf')
+    ai_key = os.environ.get('BID_AI_API_KEY', '')
+    if not ai_key:
+        try:
+            ai_key = st.secrets.get('BID_AI_API_KEY', '')
+        except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+            pass
+    modes = ['文字から自動抽出'] + (['AIで読み取り'] if ai_key else [])
+    mode = st.radio('読み取り方法', modes, horizontal=True)
+    if not ai_key:
+        st.caption('AI読み取りは未設定です。文字PDFの自動抽出はそのまま使えます。')
+    else:
+        st.caption('AI読み取りを選ぶと公告内容をOpenAIへ送信します。APIの利用料金が発生します。')
+    if upload is not None:
+        content = upload.getvalue()
+        identity = hashlib.sha256(content + mode.encode()).hexdigest()
+        if st.button('PDFを読み取る'):
+            try:
+                with st.spinner('公告を読み取っています…'):
+                    text, scanned = pdf_content(content)
+                    values, sources, warnings = extract_rules(text)
+                    if mode == 'AIで読み取り':
+                        values = extract_ai(content, text, scanned, ai_key, os.environ.get('BID_AI_MODEL', 'gpt-4.1-mini'))
+                        warnings.append('AIの候補です。原文と日付を確認してから追加してください。')
+                    elif scanned:
+                        warnings.append('画像のページがあります。文字のない部分は自動抽出できません。AI読み取りまたは手動入力を使用してください。')
+                    st.session_state.notice_result = {'id': identity, 'values': values, 'sources': sources, 'warnings': warnings, 'text': text}
+            except ValueError as e:
+                st.error(str(e))
+        result = st.session_state.get('notice_result')
+        if result and result['id'] == identity:
+            for warning in result['warnings']:
+                st.warning(warning)
+            st.caption('空欄は読み取れなかった項目です。工期が「契約日から」の場合、開始日は推測せず空欄にします。')
+            with st.form('notice_review_' + identity):
+                title = st.text_input('読み取った件名', value=result['values']['件名'] or '')
+                engineer = st.text_input('配置技術者名（自分で入力）')
+                reviewed = {}
+                for column in DATES:
+                    value = result['values'][column]
+                    reviewed[column] = st.date_input(column + '（確認）', value=date.fromisoformat(value) if value else None)
+                add_notice = st.form_submit_button('確認した内容を案件表へ追加')
+            with st.expander('読み取りの根拠・PDFの抽出文字'):
+                for column, source in result['sources'].items():
+                    st.write(column)
+                    st.text(source)
+                st.text(result['text'] or '文字が抽出できませんでした。原本のPDFを確認してください。')
+            if add_notice:
+                if not title.strip():
+                    st.error('件名を入力してください。')
+                elif reviewed['工期開始'] and reviewed['工期終了'] and reviewed['工期開始'] > reviewed['工期終了']:
+                    st.error('工期終了は開始日以降にしてください。')
+                elif identity in st.session_state.get('notice_added', []):
+                    st.warning('このPDFの読み取り結果は追加済みです。表で修正してください。')
+                else:
+                    try:
+                        current = normalize(edited)
+                        record = {'件名': title.strip(), '配置技術者名': engineer.strip(), **{k: v.isoformat() if v else None for k, v in reviewed.items()}, '備考': '公告PDF: ' + upload.name}
+                        frame = pd.DataFrame(current + [record], columns=COLUMNS)
+                        for column in DATES:
+                            frame[column] = pd.to_datetime(frame[column]).dt.date
+                        st.session_state.bid_frame = frame
+                        st.session_state.bid_editor_version += 1
+                        st.session_state.notice_added = st.session_state.get('notice_added', []) + [identity]
+                        st.session_state.notice_import_message = True
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+if st.session_state.pop('notice_import_message', False):
+    st.success('案件表へ追加しました。内容を確認して「変更を保存」を押してください。')
+
 left, right = st.columns([1, 3])
 with left:
     if st.button('変更を保存', type='primary'):
